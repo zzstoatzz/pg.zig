@@ -102,7 +102,7 @@ const TLSStream = struct {
             }
             openssl.SSL_free(ssl);
         }
-        posix.close(self.socket);
+        _ = std.c.close(self.socket);
     }
 
     pub fn writeAll(self: *Stream, data: []const u8) !void {
@@ -152,7 +152,7 @@ const PlainStream = struct {
             const handle = (try hostname.connect(io, port, .{ .mode = .stream })).socket.handle;
             break :blk handle;
         };
-        errdefer posix.close(socket);
+        errdefer _ = std.c.close(socket);
 
         return .{
             .socket = socket,
@@ -161,7 +161,7 @@ const PlainStream = struct {
     }
 
     pub fn close(self: *const PlainStream) void {
-        posix.close(self.socket);
+        _ = std.c.close(self.socket);
     }
 
     pub fn writeAll(self: *const PlainStream, data: []const u8) !void {
