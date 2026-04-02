@@ -22,7 +22,7 @@ pub const Pool = struct {
     _allocator: Allocator,
     _io: Io,
     _mutex: Io.Mutex,
-    _event: Io.Event,
+    _notify: std.atomic.Value(u32),
     _ssl_ctx: ?*lib.SSLCtx,
     _reconnector: Reconnector,
     _arena: std.heap.ArenaAllocator,
@@ -76,7 +76,7 @@ pub const Pool = struct {
         const connect_on_init_count = opts.connect_on_init_count orelse size;
 
         pool.* = .{
-            ._event = .unset,
+            ._notify = .init(0),
             ._io = io,
             ._mutex = .init,
             ._conns = conns,
@@ -128,46 +128,42 @@ pub const Pool = struct {
 
         while (true) {
             self._mutex.lockUncancelable(self._io);
-            const missing = self._missing;
-            var available = self._available;
-            var conns = self._conns;
-            self._mutex.unlock(self._io);
 
-            if (available == 0) {
-                // Check if pool is completely exhausted
-                const total_alive = conns.len - missing;
-                if (total_alive == 0) {
-                    return error.PoolExhausted;
-                }
-
-                lib.metrics.poolEmpty();
-
-                // Calculate remaining timeout
-                const now = Io.Clock.awake.now(self._io).toNanoseconds();
-                if (now >= deadline) {
-                    std.log.debug("Timeout {} > {}", .{ now, deadline });
-                    return error.Timeout;
-                }
-                const remaining_ns: u64 = @intCast(deadline - now);
-
-                try self._event.waitTimeout(self._io, .{
-                    .duration = .{
-                        .raw = .fromNanoseconds(remaining_ns),
-                        .clock = .awake,
-                    },
-                });
-                self._event.reset();
-                continue;
+            if (self._available > 0) {
+                const index = self._available - 1;
+                const conn = self._conns[index];
+                self._available = index;
+                self._mutex.unlock(self._io);
+                return conn;
             }
 
-            self._mutex.lockUncancelable(self._io);
-            conns = self._conns;
-            available = self._available;
-            const index = available - 1;
-            const conn = conns[index];
-            self._available = index;
-            defer self._mutex.unlock(self._io);
-            return conn;
+            // No connections available — read state under mutex for consistency
+            const total_alive = self._conns.len - self._missing;
+            const notify_epoch = self._notify.load(.acquire);
+            self._mutex.unlock(self._io);
+
+            if (total_alive == 0) {
+                return error.PoolExhausted;
+            }
+
+            lib.metrics.poolEmpty();
+
+            const now = Io.Clock.awake.now(self._io).toNanoseconds();
+            if (now >= deadline) {
+                std.log.debug("Timeout {} > {}", .{ now, deadline });
+                return error.Timeout;
+            }
+            const remaining_ns: u64 = @intCast(deadline - now);
+
+            // Wait for a connection to be released. Uses a monotonic counter
+            // instead of Io.Event to support multiple concurrent waiters safely
+            // (Io.Event.reset assumes no pending waiters — violated under contention).
+            self._io.futexWaitTimeout(u32, &self._notify.raw, notify_epoch, .{
+                .duration = .{
+                    .raw = .fromNanoseconds(remaining_ns),
+                    .clock = .awake,
+                },
+            }) catch |err| return err;
         }
     }
 
@@ -197,13 +193,13 @@ pub const Pool = struct {
             };
         }
 
-        var conns = self._conns;
         self._mutex.lockUncancelable(self._io);
         const available = self._available;
-        conns[available] = conn_to_add;
+        self._conns[available] = conn_to_add;
         self._available = available + 1;
         self._mutex.unlock(self._io);
-        self._event.set(self._io);
+        _ = self._notify.fetchAdd(1, .release);
+        self._io.futexWake(u32, &self._notify.raw, 1);
     }
 
     pub fn newListener(self: *Pool) !Listener {
