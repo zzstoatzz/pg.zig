@@ -1,0 +1,70 @@
+name: ci
+
+on:
+  push:
+    branches: [master, dev]
+  pull_request:
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  # No database needed: formatting, plus a compile of every build-config
+  # permutation and the example. `zig build test` only ever compiles
+  # openssl=true/column_names=false and never touches example/, so this is what
+  # keeps those paths from rotting.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install openssl
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: install zig
+        run: |
+          curl -sSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | tar -xJ
+          echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      # zig fmt walks zig-pkg/, so list paths explicitly rather than using `.`
+      - name: check formatting
+        run: zig fmt --check build.zig build.zig.zon src test_runner.zig example
+
+      - name: compile all permutations + example
+        run: zig build check -Dopenssl_lib_name=ssl
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install openssl
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: install zig
+        run: |
+          curl -sSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | tar -xJ
+          echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      # server.crt/server.key are gitignored, so a fresh clone has no server
+      # certificate and the TLS tests cannot pass without this.
+      - name: generate test certificates
+        run: make ssl
+
+      - name: start postgres
+        run: docker compose -f tests/compose.yml up -d
+
+      - name: wait for postgres
+        run: |
+          for _ in $(seq 1 60); do
+            if docker compose -f tests/compose.yml exec -T postgres pg_isready -U postgres; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "postgres never became ready"
+          docker compose -f tests/compose.yml logs
+          exit 1
+
+      - name: run tests
+        run: zig build test -Dopenssl_lib_name=ssl

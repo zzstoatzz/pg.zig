@@ -104,4 +104,73 @@ pub fn build(b: *std.Build) !void {
         const test_step = b.step("test", "Run unit tests");
         test_step.dependOn(&run_test.step);
     }
+
+    {
+        // `zig build test` compiles exactly one configuration -- openssl=true,
+        // column_names=false -- and never compiles example/ at all, since that
+        // is its own build root. Both can hide a compile error behind a green
+        // test run. These are not dead paths: `has_openssl` selects a different
+        // Stream type (stream.zig) and `column_names` changes Conn.Opts.
+        //
+        // This step compiles all four permutations plus example/ without
+        // running anything, so it needs no database.
+        const check_step = b.step("check", "compile every build-config permutation (no database needed)");
+
+        for ([_]bool{ false, true }) |ssl| {
+            for ([_]bool{ false, true }) |cols| {
+                const ssl_module = if (ssl) blk: {
+                    const Translator = @import("translate_c").Translator;
+                    const tc: Translator = .init(b.dependency("translate_c", .{}), .{
+                        .c_source_file = b.path("src/openssl.h"),
+                        .target = target,
+                        .optimize = optimize,
+                    });
+                    if (openssl_include_path) |p| tc.addIncludePath(p);
+                    break :blk tc.mod;
+                } else b.createModule(.{ .root_source_file = b.path("src/openssl_stub.zig") });
+
+                const variant = b.addTest(.{
+                    .root_module = b.createModule(.{
+                        .target = target,
+                        .optimize = optimize,
+                        .root_source_file = b.path("src/pg.zig"),
+                        .imports = &.{
+                            .{ .name = "buffer", .module = b.dependency("buffer", dep_opts).module("buffer") },
+                            .{ .name = "metrics", .module = b.dependency("metrics", dep_opts).module("metrics") },
+                            .{ .name = "openssl", .module = ssl_module },
+                        },
+                    }),
+                    .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
+                });
+                if (ssl) {
+                    if (openssl_lib_path) |p| variant.root_module.addLibraryPath(p);
+                    variant.root_module.linkSystemLibrary("crypto", .{});
+                    variant.root_module.linkSystemLibrary(openssl_lib_name orelse "ssl", .{});
+                }
+                // t.zig reads PG_TEST_HOST/PG_TEST_PORT via std.c.getenv, so the
+                // test build needs libc regardless of the openssl permutation.
+                variant.root_module.link_libc = true;
+
+                const options = b.addOptions();
+                options.addOption(bool, "openssl", ssl);
+                options.addOption(bool, "column_names", cols);
+                variant.root_module.addOptions("config", options);
+
+                // depend on the compile step, not a run step: we want the
+                // analysis, not the suite four more times
+                check_step.dependOn(&variant.step);
+            }
+        }
+
+        const example = b.addExecutable(.{
+            .name = "example",
+            .root_module = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+                .root_source_file = b.path("example/main.zig"),
+                .imports = &.{.{ .name = "pg", .module = pg_module }},
+            }),
+        });
+        check_step.dependOn(&example.step);
+    }
 }

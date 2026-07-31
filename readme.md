@@ -688,6 +688,13 @@ const pg_module = b.dependency("pg", .{
 
 ## Tests
 
+The TLS tests need a server certificate, which is not checked in. Generate the
+cert set once:
+
+```console
+make ssl
+```
+
 Launch the Postgres database with the provided Docker Compose configuration:
 
 ```console
@@ -699,4 +706,25 @@ Run tests:
 
 ```console
 zig build test
+```
+
+The suite defaults to `127.0.0.1:5432`. If something else already owns that
+port, retarget it — otherwise the tests will happily connect to whatever is
+listening there:
+
+```console
+PG_TEST_HOST=127.0.0.1 PG_TEST_PORT=55432 zig build test
+```
+
+Change the port mapping in `tests/compose.yml` to match. The image is
+`postgis/postgis` because one test creates the `postgis` extension.
+
+### Compiling every configuration
+
+`zig build test` compiles one configuration (openssl on, column_names off) and
+does not compile `example/` at all. To compile all four `openssl` x
+`column_names` permutations plus the example — no database required:
+
+```console
+zig build check
 ```

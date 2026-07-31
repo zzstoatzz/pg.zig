@@ -431,6 +431,7 @@ test "Pool" {
     var pool = try Pool.init(t.io, t.allocator, .{
         .size = 2,
         .auth = t.authOpts(.{}),
+        .connect = t.connectOpts(),
         .connect_on_init_count = 1,
     });
     defer pool.deinit();
@@ -493,6 +494,7 @@ test "Pool: Release" {
             .username = "postgres",
             .password = "postgres",
         },
+        .connect = t.connectOpts(),
     });
     defer pool.deinit();
 
@@ -505,6 +507,7 @@ test "Pool: stats" {
     var pool = try Pool.init(t.io, t.allocator, .{
         .size = 3,
         .auth = t.authOpts(.{}),
+        .connect = t.connectOpts(),
     });
     defer pool.deinit();
 
@@ -559,7 +562,7 @@ test "Pool: stats" {
 }
 
 test "Pool: exec" {
-    var pool = try Pool.init(t.io, t.allocator, .{ .size = 1, .auth = t.authOpts(.{}) });
+    var pool = try Pool.init(t.io, t.allocator, .{ .size = 1, .auth = t.authOpts(.{}), .connect = t.connectOpts() });
     defer pool.deinit();
 
     {
@@ -575,7 +578,7 @@ test "Pool: exec" {
 }
 
 test "Pool: Query/Row" {
-    var pool = try Pool.init(t.io, t.allocator, .{ .size = 1, .auth = t.authOpts(.{}) });
+    var pool = try Pool.init(t.io, t.allocator, .{ .size = 1, .auth = t.authOpts(.{}), .connect = t.connectOpts() });
     defer pool.deinit();
 
     {
@@ -608,7 +611,7 @@ test "Pool: Query/Row" {
 }
 
 test "Pool: Row error" {
-    var pool = try Pool.init(t.io, t.allocator, .{ .size = 1, .auth = t.authOpts(.{}) });
+    var pool = try Pool.init(t.io, t.allocator, .{ .size = 1, .auth = t.authOpts(.{}), .connect = t.connectOpts() });
     defer pool.deinit();
 
     _ = try pool.rowUnsafe("insert into all_types (id) values ($1)", .{200});
@@ -631,7 +634,7 @@ test "Pool: init owns its connection strings" {
     var pool = try Pool.init(t.io, t.allocator, .{
         .size = 2,
         .auth = .{ .username = username, .password = password, .database = database },
-        .connect = .{ .host = host },
+        .connect = .{ .host = host, .port = t.envPort() },
     });
     defer pool.deinit();
 
@@ -647,7 +650,7 @@ test "Pool: initUri owns its connection strings" {
     // Heap-allocate the URI string and free it right after init to prove the pool
     // doesn't retain pointers into it. %73 == 's': decodes to "postgres" while also
     // forcing Uri to allocate a decoded copy into the parse arena.
-    const uri_str = try t.allocator.dupe(u8, "postgresql://postgre%73:postgres@127.0.0.1:5432/postgres");
+    const uri_str = try std.fmt.allocPrint(t.allocator, "postgresql://postgre%73:postgres@{s}:{d}/postgres", .{ t.envHost(), t.envPort() });
     const uri = try std.Uri.parse(uri_str);
 
     var pool = try Pool.initUri(t.io, t.allocator, uri, .{ .size = 2 });

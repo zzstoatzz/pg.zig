@@ -38,6 +38,32 @@ pub fn expectStringSlice(expected: []const []const u8, actual: [][]const u8) !vo
     }
 }
 
+const DEFAULT_HOST = "127.0.0.1";
+const DEFAULT_PORT = 5432;
+
+/// PG_TEST_HOST / PG_TEST_PORT retarget the suite. Without these the tests go
+/// to 127.0.0.1:5432 and connect to whatever happens to be listening there,
+/// which on a developer machine is rarely the test server.
+fn env(comptime key: [:0]const u8) ?[]const u8 {
+    const raw = std.c.getenv(key.ptr) orelse return null;
+    return std.mem.sliceTo(raw, 0);
+}
+
+pub fn envHost() []const u8 {
+    return env("PG_TEST_HOST") orelse DEFAULT_HOST;
+}
+
+pub fn envPort() u16 {
+    const raw = env("PG_TEST_PORT") orelse return DEFAULT_PORT;
+    return std.fmt.parseInt(u16, raw, 10) catch DEFAULT_PORT;
+}
+
+/// Connect options aimed at the test server. Tests that construct a Pool or
+/// Conn directly must pass this; a bare `.{}` silently uses the defaults above.
+pub fn connectOpts() Conn.Opts {
+    return .{ .host = envHost(), .port = envPort() };
+}
+
 pub fn getRandom() std.Random.DefaultPrng {
     var seed: u64 = undefined;
     std.Io.random(io, std.mem.asBytes(&seed));
@@ -202,7 +228,8 @@ pub fn connect(opts: anytype) !Conn {
 
     var c = try Conn.open(io, allocator, .{
         .tls = if (@hasField(T, "tls")) opts.tls else .off,
-        .host = if (@hasField(T, "host")) opts.host else "127.0.0.1",
+        .host = if (@hasField(T, "host")) opts.host else envHost(),
+        .port = if (@hasField(T, "port")) opts.port else envPort(),
         .read_buffer = if (@hasField(T, "read_buffer")) opts.read_buffer else 2000,
     });
 
