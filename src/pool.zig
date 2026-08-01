@@ -23,7 +23,7 @@ pub const Pool = struct {
     _missing: usize,
     _allocator: Allocator,
     _mutex: Io.Mutex,
-    _cond: Io.Condition,
+    _notify: std.atomic.Value(u32),
     _ssl_ctx: ?*lib.SSLCtx,
     _reconnector: Reconnector,
     // not to be used outside of init
@@ -100,7 +100,7 @@ pub const Pool = struct {
 
         pool.* = .{
             ._io = io,
-            ._cond = .init,
+            ._notify = .init(0),
             ._mutex = .init,
             ._conns = conns,
             ._arena = arena,
@@ -153,48 +153,59 @@ pub const Pool = struct {
         const deadline = @as(i64, @intCast(self._timeout));
         const start = std.Io.Timestamp.now(io, .awake);
 
-        try self._mutex.lock(io);
-        errdefer self._mutex.unlock(io);
-
-        const SelectResult = union(enum) { t: Io.Cancelable!void, c: Io.Cancelable!void };
-        var select_buf: [1]SelectResult = undefined;
-
         while (true) {
+            try self._mutex.lock(io);
+
             const available = self._available;
-            const missing = self._missing;
-
-            if (available == 0) {
-                // Check if pool is completely exhausted
-                const total_alive = self._conns.len - missing;
-                if (total_alive == 0) {
-                    return error.PoolExhausted;
-                }
-
-                lib.metrics.poolEmpty();
-
-                // Calculate remaining timeout
-                const now = std.Io.Timestamp.now(io, .awake);
-                const elapsed = start.durationTo(now).toNanoseconds();
-                if (elapsed >= deadline) {
-                    return error.Timeout;
-                }
-
-                const remaining_ns = deadline - elapsed;
-
-                var select: Io.Select(SelectResult) = .init(io, &select_buf);
-                defer select.cancelDiscard();
-                try select.concurrent(.t, Io.sleep, .{ io, .fromNanoseconds(remaining_ns), .awake });
-                try select.concurrent(.c, Io.Condition.wait, .{ &self._cond, io, &self._mutex });
-
-                _ = try select.await();
-                continue;
+            if (available > 0) {
+                const index = available - 1;
+                const conn = conns[index];
+                self._available = index;
+                self._mutex.unlock(io);
+                return conn;
             }
 
-            const index = available - 1;
-            const conn = conns[index];
-            self._available = index;
+            // Read the rest of the state under the mutex so the epoch we wait on
+            // is the one that was current when we saw an empty pool. A release
+            // between here and futexWaitTimeout bumps the counter, so the wait
+            // returns immediately instead of missing the wakeup.
+            const total_alive = self._conns.len - self._missing;
+            const notify_epoch = self._notify.load(.acquire);
             self._mutex.unlock(io);
-            return conn;
+
+            if (total_alive == 0) {
+                return error.PoolExhausted;
+            }
+
+            lib.metrics.poolEmpty();
+
+            const now = std.Io.Timestamp.now(io, .awake);
+            const elapsed = start.durationTo(now).toNanoseconds();
+            if (elapsed >= deadline) {
+                return error.Timeout;
+            }
+            const remaining_ns: u64 = @intCast(deadline - elapsed);
+
+            // A timed wait on a monotonic counter, rather than racing
+            // Io.Condition.wait against Io.sleep in an Io.Select. Io.Condition
+            // has no timed wait, so Select is the natural way to bound it -- but
+            // Select.concurrent guarantees a unit of concurrency, which under
+            // Io.Threaded is a real OS thread. That made every waiter cost two
+            // extra threads per wait iteration (measured: 3045 threads for 1024
+            // waiters on a 10-connection pool), and the resulting thread storm
+            // pushed acquires past their own timeout.
+            //
+            // The counter also avoids Io.Event, whose `reset` assumes no pending
+            // waiters -- an invariant multiple concurrent acquirers violate.
+            // Returns normally when the deadline expires (its error set is just
+            // Canceled), so the loop takes one more look for a connection and
+            // then the elapsed check above produces error.Timeout.
+            try io.futexWaitTimeout(u32, &self._notify.raw, notify_epoch, .{
+                .duration = .{
+                    .raw = .fromNanoseconds(remaining_ns),
+                    .clock = .awake,
+                },
+            });
         }
     }
 
@@ -230,8 +241,9 @@ pub const Pool = struct {
         const available = self._available;
         conns[available] = conn_to_add;
         self._available = available + 1;
+        _ = self._notify.fetchAdd(1, .release);
         self._mutex.unlock(io);
-        self._cond.signal(io);
+        io.futexWake(u32, &self._notify.raw, 1);
     }
 
     pub fn newListener(self: *Pool) !Listener {
@@ -460,6 +472,45 @@ test "Pool" {
         const affected = try c1.exec("delete from pool_test", .{});
         try t.expectEqual(1500, affected.?);
     }
+}
+
+// Regression: many more waiters than connections, so nearly every acquire has
+// to park and be woken by a release. Guards the notify-counter handoff -- a
+// missed wakeup or a stale epoch shows up here as a Timeout, and a wakeup that
+// only ever reaches one waiter shows up as a hang.
+test "Pool: many waiters on a small pool" {
+    var pool = try Pool.init(t.io, t.allocator, .{
+        .size = 2,
+        .auth = t.authOpts(.{}),
+        .connect = t.connectOpts(),
+        // Short, so a dropped wakeup surfaces as a prompt Timeout failure
+        // rather than as a suite that appears to hang.
+        .timeout = 2000,
+    });
+    defer pool.deinit();
+
+    const Waiter = struct {
+        fn run(p: *Pool, failures: *std.atomic.Value(u32)) void {
+            for (0..50) |_| {
+                const conn = p.acquire() catch {
+                    _ = failures.fetchAdd(1, .monotonic);
+                    return;
+                };
+                defer p.release(conn);
+                _ = conn.exec("select 1", .{}) catch {
+                    _ = failures.fetchAdd(1, .monotonic);
+                    return;
+                };
+            }
+        }
+    };
+
+    var failures: std.atomic.Value(u32) = .init(0);
+    var threads: [16]std.Thread = undefined;
+    for (&threads) |*th| th.* = try std.Thread.spawn(.{}, Waiter.run, .{ pool, &failures });
+    for (&threads) |th| th.join();
+
+    try t.expectEqual(0, failures.load(.monotonic));
 }
 
 test "Pool: deinit while the reconnector is retrying" {
