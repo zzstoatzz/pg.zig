@@ -132,6 +132,37 @@ const TLSStream = struct {
 
         return readStream(self.stream, self.io, buf);
     }
+
+    /// RFC 5929 `tls-server-end-point` channel binding data. The certificate
+    /// digest algorithm follows the certificate signature algorithm, except
+    /// that MD5 and SHA-1 certificates are upgraded to SHA-256 as required by
+    /// the RFC.
+    pub fn channelBinding(self: *const Stream, allocator: Allocator) !?[]u8 {
+        const ssl = self.ssl orelse return null;
+        const certificate = openssl.SSL_get1_peer_certificate(ssl) orelse
+            return error.MissingPeerCertificate;
+        defer openssl.X509_free(certificate);
+
+        var digest_nid: c_int = 0;
+        var public_key_nid: c_int = 0;
+        if (openssl.OBJ_find_sigid_algs(
+            openssl.X509_get_signature_nid(certificate),
+            &digest_nid,
+            &public_key_nid,
+        ) != 1) return error.UnsupportedCertificateSignature;
+
+        const digest_type = if (digest_nid == openssl.NID_md5 or digest_nid == openssl.NID_sha1)
+            openssl.EVP_sha256()
+        else
+            openssl.EVP_get_digestbynid(digest_nid);
+        if (digest_type == null) return error.UnsupportedCertificateDigest;
+
+        var digest: [openssl.EVP_MAX_MD_SIZE]u8 = undefined;
+        var digest_len: c_uint = 0;
+        if (openssl.X509_digest(certificate, digest_type, &digest, &digest_len) != 1)
+            return error.CertificateDigestFailed;
+        return @as(?[]u8, try allocator.dupe(u8, digest[0..digest_len]));
+    }
 };
 
 const PlainStream = struct {
@@ -180,6 +211,10 @@ const PlainStream = struct {
 
     pub fn read(self: *const PlainStream, buf: []u8) !usize {
         return readStream(self.stream, self.io, buf);
+    }
+
+    pub fn channelBinding(_: *const PlainStream, _: Allocator) !?[]u8 {
+        return null;
     }
 };
 

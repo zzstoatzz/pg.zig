@@ -129,6 +129,27 @@ Authentications the request. Prefer creating connections through the pool. Auth 
 * `timeout` : Defaults to `10_000` (milliseconds)
 * `application_name`: Defaults to `null`
 * `params`: Defaults to `null`. An `std.StringHashMap([]const u8)`
+* `channel_binding`: Controls SCRAM channel binding over TLS. `prefer` (the
+  default) selects `SCRAM-SHA-256-PLUS` when the server offers it, `require`
+  fails unless TLS channel binding and the PLUS mechanism are both available,
+  and `disable` always uses unbound `SCRAM-SHA-256`.
+
+`Pool.initUri` and `Conn.openAndAuthUri` accept the corresponding
+`channel_binding=disable|prefer|require` query parameter. For example:
+
+```zig
+const uri = try std.Uri.parse(
+    "postgresql://user:password@example.com/database" ++
+        "?sslmode=require&channel_binding=require",
+);
+var pool = try pg.Pool.initUri(io, allocator, uri, .{ .size = 5 });
+defer pool.deinit();
+```
+
+Channel binding requires an OpenSSL-enabled build, a TLS connection, a server
+certificate with a defined `tls-server-end-point` digest, PostgreSQL 11 or
+later, and SCRAM authentication. `require` reports an error instead of silently
+falling back when any of those conditions is absent.
 
 ### release(conn: \*Conn) void
 Releases the connection back to the pool. The pool might decide to close the connection and open a new one.

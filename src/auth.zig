@@ -76,18 +76,33 @@ pub fn auth(io: Io, stream: *Stream, buf: *Buffer, reader: *Reader, opts: Opts) 
 }
 
 fn saslAuth(io: Io, req: proto.AuthenticationRequest.SASL, stream: *Stream, buf: *Buffer, reader: *Reader, opts: Opts) !?[]const u8 {
-    if (!req.scram_sha_256) {
+    var sasl_buf: [2048]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&sasl_buf);
+    const allocator = fba.allocator();
+    const binding = if (opts.channel_binding == .disable)
+        null
+    else
+        try stream.channelBinding(allocator);
+    const use_plus = binding != null and req.scram_sha_256_plus and
+        opts.channel_binding != .disable;
+    if (opts.channel_binding == .require) {
+        if (binding == null) return error.ChannelBindingUnavailable;
+        if (!req.scram_sha_256_plus) return error.ChannelBindingNotOffered;
+    } else if (!use_plus and !req.scram_sha_256) {
         return error.UnexpectedDBMessage;
     }
-    var sasl_buf: [1024]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&sasl_buf);
-    var sasl = try SASL.init(io, fba.allocator());
+    var sasl = try SASL.init(
+        io,
+        allocator,
+        if (use_plus) binding else null,
+        binding != null and opts.channel_binding != .disable,
+    );
 
     {
         // send the client initial response
         const msg = proto.SASLInitialResponse{
             .response = sasl.client_first_message,
-            .mechanism = "SCRAM-SHA-256",
+            .mechanism = if (use_plus) "SCRAM-SHA-256-PLUS" else "SCRAM-SHA-256",
         };
         buf.resetRetainingCapacity();
         try msg.write(buf);
@@ -161,6 +176,8 @@ fn passwordAuth(password: []const u8, stream: *Stream, buf: *Buffer) !void {
 const SASL = struct {
     allocator: Allocator,
     client_first_message: []u8,
+    gs2_header_length: usize,
+    channel_binding_data: ?[]const u8,
     auth_message: ?[]const u8 = null,
     salted_password: ?[32]u8 = null,
     server_response: ?ServerResponse = null,
@@ -168,24 +185,31 @@ const SASL = struct {
     const Base64Encoder = std.base64.standard.Encoder;
     const Base64Decoder = std.base64.standard.Decoder;
 
-    pub fn init(io: Io, allocator: Allocator) !SASL {
+    pub fn init(
+        io: Io,
+        allocator: Allocator,
+        channel_binding_data: ?[]const u8,
+        supports_channel_binding: bool,
+    ) !SASL {
         var nonce: [18]u8 = undefined;
         std.Io.random(io, &nonce);
 
-        var client_first_message = try allocator.alloc(u8, 32);
-        client_first_message[0] = 'n';
-        client_first_message[1] = ',';
-        client_first_message[2] = ',';
-        client_first_message[3] = 'n';
-        client_first_message[4] = '=';
-        client_first_message[5] = ',';
-        client_first_message[6] = 'r';
-        client_first_message[7] = '=';
-        _ = Base64Encoder.encode(client_first_message[8..], &nonce);
+        const gs2_header = if (channel_binding_data != null)
+            "p=tls-server-end-point,,"
+        else if (supports_channel_binding)
+            "y,,"
+        else
+            "n,,";
+        var client_first_message = try allocator.alloc(u8, gs2_header.len + 5 + 24);
+        @memcpy(client_first_message[0..gs2_header.len], gs2_header);
+        @memcpy(client_first_message[gs2_header.len..][0..5], "n=,r=");
+        _ = Base64Encoder.encode(client_first_message[gs2_header.len + 5 ..], &nonce);
 
         return .{
             .allocator = allocator,
             .client_first_message = client_first_message,
+            .gs2_header_length = gs2_header.len,
+            .channel_binding_data = channel_binding_data,
         };
     }
 
@@ -250,8 +274,18 @@ const SASL = struct {
             break :blk s;
         };
 
-        const unproved = try std.fmt.allocPrint(allocator, "c=biws,r={s}", .{sr.nonce});
-        const auth_message = try std.fmt.allocPrint(allocator, "{s},{s},{s}", .{ self.client_first_message[3..], sr.raw, unproved });
+        const binding_data = self.channel_binding_data orelse &.{};
+        const binding_input = try allocator.alloc(u8, self.gs2_header_length + binding_data.len);
+        @memcpy(binding_input[0..self.gs2_header_length], self.client_first_message[0..self.gs2_header_length]);
+        @memcpy(binding_input[self.gs2_header_length..], binding_data);
+        const encoded_binding = try allocator.alloc(u8, Base64Encoder.calcSize(binding_input.len));
+        _ = Base64Encoder.encode(encoded_binding, binding_input);
+        const unproved = try std.fmt.allocPrint(allocator, "c={s},r={s}", .{ encoded_binding, sr.nonce });
+        const auth_message = try std.fmt.allocPrint(allocator, "{s},{s},{s}", .{
+            self.client_first_message[self.gs2_header_length..],
+            sr.raw,
+            unproved,
+        });
         const salted_password = blk: {
             var buf: [32]u8 = undefined;
             try std.crypto.pwhash.pbkdf2(&buf, password, salt, sr.iterations, std.crypto.auth.hmac.sha2.HmacSha256);
@@ -319,17 +353,17 @@ pub const ServerResponse = struct {
 const t = @import("lib.zig").testing;
 test "SASL: init" {
     defer t.reset();
-    var sasl1 = try SASL.init(t.io, t.arena.allocator());
+    var sasl1 = try SASL.init(t.io, t.arena.allocator(), null, false);
 
     try t.expectString("n,,n=,r=", sasl1.client_first_message[0..8]);
 
-    var sasl2 = try SASL.init(t.io, t.arena.allocator());
+    var sasl2 = try SASL.init(t.io, t.arena.allocator(), null, false);
     try t.expectString("n,,n=,r=", sasl2.client_first_message[0..8]);
 
-    var sasl3 = try SASL.init(t.io, t.arena.allocator());
+    var sasl3 = try SASL.init(t.io, t.arena.allocator(), null, false);
     try t.expectString("n,,n=,r=", sasl3.client_first_message[0..8]);
 
-    var sasl4 = try SASL.init(t.io, t.arena.allocator());
+    var sasl4 = try SASL.init(t.io, t.arena.allocator(), null, false);
     try t.expectString("n,,n=,r=", sasl4.client_first_message[0..8]);
 
     // The nonce should be random. It's unlikely that if we generate 4, we'd get
@@ -368,7 +402,7 @@ test "SASL: serverResponse invalid" {
     };
 
     defer t.reset();
-    var sasl = try SASL.init(t.io, t.arena.allocator());
+    var sasl = try SASL.init(t.io, t.arena.allocator(), null, false);
 
     for (test_cases) |tc| {
         try t.expectError(tc.expected, sasl.serverResponse(tc.input));
@@ -378,10 +412,44 @@ test "SASL: serverResponse invalid" {
 
 test "SASL: serverResponse" {
     defer t.reset();
-    var sasl = try SASL.init(t.io, t.arena.allocator());
+    var sasl = try SASL.init(t.io, t.arena.allocator(), null, false);
 
     try sasl.serverResponse("r=abc123,s=aaaaxa,i=4096");
     try t.expectString("abc123", sasl.server_response.?.nonce);
     try t.expectString("aaaaxa", sasl.server_response.?.base64_salt);
     try t.expectEqual(4096, sasl.server_response.?.iterations);
+}
+
+test "SASL: PLUS binds the TLS server endpoint into the proof" {
+    defer t.reset();
+    const binding = [_]u8{ 1, 2, 3 };
+    var sasl = try SASL.init(t.io, t.arena.allocator(), &binding, true);
+    try t.expectString(
+        "p=tls-server-end-point,,n=,r=",
+        sasl.client_first_message[0..29],
+    );
+    const server_nonce = try std.fmt.allocPrint(
+        t.arena.allocator(),
+        "{s}server",
+        .{sasl.client_first_message[sasl.gs2_header_length + 5 ..]},
+    );
+    const response = try std.fmt.allocPrint(
+        t.arena.allocator(),
+        "r={s},s=QSXCR+Q6sek8bf92,i=4096",
+        .{server_nonce},
+    );
+    try sasl.serverResponse(response);
+    const final = try sasl.clientFinalMessage("password");
+    try t.expectEqual(true, std.mem.startsWith(
+        u8,
+        final,
+        "c=cD10bHMtc2VydmVyLWVuZC1wb2ludCwsAQID,r=",
+    ));
+}
+
+test "SASL: supported channel binding signals a non-PLUS server" {
+    defer t.reset();
+    var sasl = try SASL.init(t.io, t.arena.allocator(), null, true);
+    try t.expectString("y,,n=,r=", sasl.client_first_message[0..8]);
+    try t.expectEqual(@as(usize, 3), sasl.gs2_header_length);
 }

@@ -248,6 +248,7 @@ pub fn authOpts(opts: anytype) Conn.AuthOpts {
         .database = if (@hasField(T, "database")) opts.database else "postgres",
         .username = if (@hasField(T, "username")) opts.username else "postgres",
         .password = if (@hasField(T, "password")) opts.password else "postgres",
+        .channel_binding = if (@hasField(T, "channel_binding")) opts.channel_binding else .prefer,
     };
 }
 

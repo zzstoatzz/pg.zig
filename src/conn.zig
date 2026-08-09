@@ -107,6 +107,9 @@ pub const Conn = struct {
         timeout: u32 = 10_000,
         application_name: ?[]const u8 = null,
         startup_parameters: ?std.hash_map.StringHashMap([]const u8) = null,
+        channel_binding: ChannelBinding = .prefer,
+
+        pub const ChannelBinding = enum { disable, prefer, require };
     };
 
     pub const QueryOpts = struct {
@@ -1962,6 +1965,16 @@ test "Conn: TLS verify-full" {
         var conn = try t.connect(.{ .tls = Conn.Opts.TLS{ .verify_full = "tests/root.crt" }, .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw" });
         defer conn.deinit();
     }
+}
+
+test "Conn: TLS channel binding required" {
+    var conn = try t.connect(.{
+        .tls = Conn.Opts.TLS{ .verify_full = "tests/root.crt" },
+        .username = "pgz_user_ssl",
+        .password = "pgz_user_ssl_pw",
+        .channel_binding = Conn.AuthOpts.ChannelBinding.require,
+    });
+    defer conn.deinit();
 }
 
 test "Conn: query is cancelable" {

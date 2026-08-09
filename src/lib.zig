@@ -151,6 +151,7 @@ pub fn parseOpts(uri: std.Uri, allocator: std.mem.Allocator) !ParsedOpts {
 
     var tls: Conn.Opts.TLS = .off;
     var tcp_user_timeout: ?u32 = null;
+    var channel_binding: Conn.AuthOpts.ChannelBinding = .prefer;
     if (uri.query) |qry| {
         const query_string = try qry.toRawMaybeAlloc(aa);
         var it = std.mem.splitScalar(u8, query_string, '&');
@@ -160,6 +161,9 @@ pub fn parseOpts(uri: std.Uri, allocator: std.mem.Allocator) !ParsedOpts {
             const val = it2.rest();
             if (std.mem.eql(u8, key, "tcp_user_timeout")) {
                 tcp_user_timeout = try std.fmt.parseInt(u32, val, 10);
+            } else if (std.mem.eql(u8, key, "channel_binding")) {
+                channel_binding = std.meta.stringToEnum(Conn.AuthOpts.ChannelBinding, val) orelse
+                    return error.UnsupportedChannelBindingValue;
             } else if (std.mem.eql(u8, key, "sslmode")) {
                 if (std.mem.eql(u8, val, "require")) {
                     tls = .require;
@@ -187,6 +191,7 @@ pub fn parseOpts(uri: std.Uri, allocator: std.mem.Allocator) !ParsedOpts {
             .password = password,
             .database = if (path.len == 0) null else path,
             .timeout = tcp_user_timeout orelse 10_000,
+            .channel_binding = channel_binding,
         },
         .connect = .{
             .tls = tls,
@@ -292,7 +297,7 @@ pub const TypeError = error{
     UnknownColumnName,
 };
 
-const valid_tcs: [2]TestCase = .{
+const valid_tcs: [3]TestCase = .{
     .{ .uri = "postgresql:///", .expected_opts = .{ .size = 0, .auth = .{ .username = "postgres" }, .connect = .{}, .timeout = 0 } },
     .{ .uri = "postgresql://user:pass@somehost:1234/somedb?tcp_user_timeout=5678", .expected_opts = .{ .size = 0, .auth = .{
         .username = "user",
@@ -303,6 +308,17 @@ const valid_tcs: [2]TestCase = .{
         .host = "somehost",
         .port = 1234,
     }, .timeout = 0 } },
+    .{ .uri = "postgresql://user:pass@somehost/somedb?channel_binding=require&sslmode=verify-full", .expected_opts = .{
+        .size = 0,
+        .auth = .{
+            .username = "user",
+            .password = "pass",
+            .database = "somedb",
+            .channel_binding = .require,
+        },
+        .connect = .{ .host = "somehost", .tls = .{ .verify_full = null } },
+        .timeout = 0,
+    } },
 };
 
 test "URI: parse valid" {
@@ -323,4 +339,5 @@ test "URI: invalid scheme" {
 
 test "URI: invalid params" {
     try std.testing.expectError(error.UnsupportedConnectionParam, parseOpts(try std.Uri.parse("postgresql:///?bar=baz"), std.testing.allocator));
+    try std.testing.expectError(error.UnsupportedChannelBindingValue, parseOpts(try std.Uri.parse("postgresql:///?channel_binding=sometimes"), std.testing.allocator));
 }
