@@ -252,8 +252,9 @@ pub const Conn = struct {
     }
 
     pub fn queryOpts(self: *Conn, sql: []const u8, values: anytype, opts: QueryOpts) !*Result {
+        errdefer self.maybeRelease(opts.release_conn);
+
         if (self.canQuery() == false) {
-            self.maybeRelease(opts.release_conn);
             return error.ConnectionBusy;
         }
 
@@ -278,10 +279,7 @@ pub const Conn = struct {
         if (cached == false) {
             // either this isn't supposed to be cached, or it is, but we don't
             // have it in our cache
-            stmt = Stmt.init(self, opts) catch |err| {
-                self.maybeRelease(opts.release_conn);
-                return err;
-            };
+            stmt = try Stmt.init(self, opts);
 
             errdefer stmt.deinit();
             if (name) |n| {
@@ -316,7 +314,6 @@ pub const Conn = struct {
 
         return stmt.execute() catch |err| {
             stmt.deinit();
-            self.maybeRelease(opts.release_conn);
             return err;
         };
     }

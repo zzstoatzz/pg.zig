@@ -287,7 +287,6 @@ pub const Pool = struct {
         var opts = opts_;
         opts.release_conn = true;
         var conn = try self.acquire();
-        errdefer self.release(conn);
         return conn.queryOpts(sql, values, opts);
     }
 
@@ -672,6 +671,17 @@ test "Pool: Row error" {
     try t.expectError(error.PG, pool.rowUnsafe("insert into all_types (id) values ($1)", .{200}));
 
     try t.expectEqual(1, pool._available);
+}
+
+test "Pool: Query error returns the connection exactly once" {
+    var pool = try Pool.init(t.io, t.allocator, .{ .size = 1, .auth = t.authOpts(.{}), .connect = t.connectOpts() });
+    defer pool.deinit();
+
+    try t.expectError(error.PG, pool.query("select * from table_that_does_not_exist", .{}));
+
+    const stats = pool.stats();
+    try t.expectEqual(1, stats.available);
+    try t.expectEqual(0, stats.in_use);
 }
 
 test "Pool: init owns its connection strings" {
